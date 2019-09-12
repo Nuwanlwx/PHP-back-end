@@ -1,0 +1,756 @@
+  <?php
+require_once dirname(__FILE__).'/utils.php';
+if (!mysql_connect(DB_SERVER, DB_USER, DB_PASS)) {
+  exit(db_error(__FILE__, __FUNCTION__, __LINE__, ERR_DB_CONNECT, mysql_errno(), mysql_error()));
+}
+if (!mysql_select_db(DB_NAME)) {
+  $query = "create database ".DB_NAME;
+  if (!mysql_query($query)) {
+    exit(db_error(__FILE__, __FUNCTION__, __LINE__, ERR_DB_CONNECT, mysql_errno(), mysql_error()));
+  } else {
+    info(__FILE__, __FUNCTION__, __LINE__, DB_NAME, "Created DB");
+  }
+}
+
+function user_validation($user, $pass) {
+  $encrypted_pass = pass_encrypt($pass);
+  $user = strtolower($user);
+  // Check permitted usernames
+  $non_permitted_username_char = array('\'');
+  if (str_replace($non_permitted_username_char, "", $user) != $user) {
+    return ERR_NON_PERMITTED_USERNAME;
+  }
+
+  $query = "select ".FIELD_USER.", ".FIELD_ID.", ".FIELD_TYPE." from ".TBL_USER." where ".FIELD_USER."='$user' and ".FIELD_PASS."='$encrypted_pass'";
+  $result = mysql_query($query);
+  
+  $db_errno = mysql_errno();
+  if (!$result && $db_errno) {
+    exit(db_error(__FILE__, __FUNCTION__, __LINE__, ERR_DB_READ, $db_errno, mysql_error(), false));
+  }
+  if (!$result || mysql_num_rows($result) != 1) {
+    info(__FILE__, __FUNCTION__, __LINE__, ERR_AUTHENTICATION, $user, $encrypted_pass);
+    return ERR_AUTHENTICATION;
+  }
+  $raw = mysql_fetch_array($result, MYSQL_ASSOC);
+  $db_id = $raw[FIELD_ID];
+  $db_user = $raw[FIELD_USER];
+  $db_type = $raw[FIELD_TYPE];
+  if ($db_user != $user) {
+    info(__FILE__, __FUNCTION__, __LINE__, ERR_AUTHENTICATION, $user, $db_user);
+    return ERR_AUTHENTICATION;
+  }
+
+  session_start();
+  $_SESSION[FIELD_ID] = $db_id;
+  $_SESSION[FIELD_USER] = $db_user;
+  $_SESSION[FIELD_TYPE] = $db_type;
+  
+  update_extra_user_info($db_id);
+
+  update_user_session_id($db_id, session_id());
+  return OK_USER;
+}
+
+function user_login($user, $pass) {
+  $validation = user_validation($user, $pass);
+  if ($validation != OK_USER) {
+    return fail_return($validation, true, true, false);
+  }
+  $session_id = session_id();
+  info(__FILE__, __FUNCTION__, __LINE__, "login ok", $session_id, $_SESSION);
+  succ_return(array('status' => OK_LOGIN, 'session_id' => $session_id, 'user_type' => $_SESSION[FIELD_TYPE]));
+}
+
+function db_error($file, $func, $line, $user_error, $db_errno, $sys_error, $echo = true, $json = true) {
+  error($file, $func, $line, $user_error, $db_errno, $sys_error);
+  return fail_return($user_error, $echo, $json);
+}
+
+function db_insert($tbl, $field_list, $val_list, $echo = true, $json = true) {
+  foreach ($val_list as $key => $val) {
+    $val_list[$key] = addslashes($val);
+  }
+  $ordered_val = extract_val($field_list, $val_list);
+  $insert_query = "insert into $tbl (".implode(", ", $field_list).") values (".implode(", ", $ordered_val).");";
+  $result = mysql_query($insert_query);
+  if (!$result) {
+    $db_errno = mysql_errno();
+    if ($db_errno == 1146 && create_table($tbl, $field_list)) {
+      return db_insert($tbl, $field_list, $val_list, $echo, $json);
+    } else if ($db_errno == 1136) {
+      $id_removed_field_list = array_remove(FIELD_ID, $field_list);
+      warn(__FILE__, __FUNCTION__, __LINE__, $tbl, $id_removed_field_list, $val_list, $echo, $json);
+      return db_insert($tbl, $id_removed_field_list, $val_list, $echo, $json);
+    } else if ($db_errno == 1062) {
+      warn(__FILE__, __FUNCTION__, __LINE__, ERR_DB_INSERT_DUPLICATE, $tbl, $db_errno, mysql_error(), $insert_query);
+      return fail_return(ERR_DB_INSERT_DUPLICATE, $echo, $json);
+    } else {
+      warn(__FILE__, __FUNCTION__, __LINE__, ERR_DB_INSERT, $tbl, $db_errno, mysql_error(), $insert_query);
+      return fail_return(ERR_DB_INSERT, $echo, $json);
+    }
+  }
+  // info(__FILE__, __FUNCTION__, __LINE__, OK_DATA_INSERT, $tbl, $field_list, $val_list, $insert_query);
+  return succ_return(OK_DATA_INSERT, $echo, $json);
+}
+
+function db_multi_insert($tbl, $field_list, $val_list_of_list, $echo = true, $json = true) {
+  $field_list = array_diff($field_list, array(FIELD_ID));
+  if(count($val_list_of_list) == 0) {
+    info(__FILE__, __FUNCTION__, __LINE__, OK_DATA_INSERT, $tbl, $field_list, $val_list_of_list);
+    return succ_return(OK_DATA_INSERT, $echo, $json);
+  }
+	/* INSERTINTO`test`.`tbl_schedule_instance` (`id`, `summary`, `doctor`, `date`, `time`, `patient`, `status`) VALUES 
+	 * (NULL ,'4','21','2012-07-11','10:30','10', 0), (NULL ,'6','20','2012-07-19','12:20','25', 0) 
+	 */
+  $insert_query = "insert into $tbl (".implode(", ", $field_list).") values ";
+  $insert_arr = array();
+  foreach ($val_list_of_list as $val_list) {
+    $ordered_val = extract_val($field_list, $val_list);
+    array_push($insert_arr, "(".implode(", ", $ordered_val).")");
+  }
+  $insert_query .= implode(", ", $insert_arr);
+  $result = mysql_query($insert_query);
+  if (!$result) {
+    $db_errno = mysql_errno();
+    if ($db_errno == 1162) {
+      warn(__FILE__, __FUNCTION__, __LINE__, ERR_DB_INSERT_DUPLICATE, $tbl, $db_errno, mysql_error(), $insert_query);
+      return fail_return(ERR_DB_INSERT_DUPLICATE, $echo, $json);
+    } else {
+      warn(__FILE__, __FUNCTION__, __LINE__, ERR_DB_INSERT, $tbl, $db_errno, mysql_error(), $insert_query);
+      return fail_return(ERR_DB_INSERT, $echo, $json);
+    }
+  }
+  info(__FILE__, __FUNCTION__, __LINE__, OK_DATA_INSERT, $tbl, $field_list, $insert_query);
+  return succ_return(OK_DATA_INSERT, $echo, $json);
+}
+
+
+function extract_val($field_list, $val_list) {
+  $ret = array();
+  foreach ($field_list as $field) {
+    if (isset($val_list[$field])) {
+      $val = $val_list[$field];
+      if ($field == FIELD_USER_ID) {
+        $val = (isset($val) && $val) ? $val : 'null';
+      } else if (!preg_match("/^\(.*\)$/", $val)) {
+        $val = "'$val'";
+      }
+      $ret[$field] = $val;
+    } else {
+      $ret[$field] = 'null';
+    }
+  }
+  return $ret;
+}
+
+function create_table($tbl, $field_list) {
+  $query = "show table $tbl";
+  if(mysql_query($query)) {
+    return false;
+  }
+
+  $field_list = gen_insert_field_list($field_list);
+  $query = "create table $tbl (".implode(", ", $field_list).")";
+  if(mysql_query($query)) {
+    info(__FILE__, __FUNCTION__, __LINE__, "create", $tbl, $field_list);
+    return true;
+  }
+  return false;
+}
+
+function gen_insert_field_list($field_list) {
+  $ret = array();
+  foreach ($field_list as $field) {
+    switch ($field) {
+      case FIELD_ID:
+        array_push($ret, "$field int auto_increment primary key");
+        break;
+      default:
+        array_push($ret, "$field varchar(50)");
+        break;
+    }
+  }
+  return $ret;
+}
+
+function db_delete($tbl, $field_list, $controls, $echo = true, $json = true) {
+  $where_clause = gen_where_clause($tbl, $field_list, $controls);
+  if(!$where_clause) {
+    $ret = false;
+    foreach ($controls as $subset) {
+      if (is_array($subset)) {
+        $ret = true;
+        db_delete($tbl, $field_list, $subset, false, false);
+      }
+    }
+    return ($ret) ? succ_return(OK_DATA_DELETE, $echo, $json) : fail_return(ERR_DB_DELETE_NO_CONDITION, $echo, $json);
+  }
+  $query = "delete from `$tbl` $where_clause;";
+  $result = mysql_query($query);
+  if (!$result) {
+    $db_errno = mysql_errno();
+    warn(__FILE__, __FUNCTION__, __LINE__, ERR_DB_DELETE, $tbl, $db_errno, mysql_error(), $query);
+    return fail_return(ERR_DB_DELETE, $echo, $json);
+  }
+  info(__FILE__, __FUNCTION__, __LINE__, OK_DATA_DELETE, $tbl, $field_list, $controls, mysql_affected_rows(), $query);
+  return succ_return(OK_DATA_DELETE, $echo, $json);
+}
+
+function db_read($tbl, $controls, $echo = true, $json = true) {
+  get_tbl_desc($tbl);
+  return db_search($tbl, get_field_list($tbl), $controls, $echo, $json);
+}
+
+function db_search($tbl, $field_list, $controls, $echo = true, $json = true) {
+  foreach ($controls as $key => $val) {
+    $controls[$key] = addslashes($val);
+  }
+  $ret = fail_return(ERR_UNKNOWN, false);
+  $where_clause = gen_where_clause($tbl, array_keys($controls), $controls);
+  $order_by = gen_order_by($tbl, $controls);
+  $query = "select SQL_CALC_FOUND_ROWS `$tbl`.`".implode("`, `$tbl`.`", $field_list)."` from $tbl $where_clause $order_by ".gen_limit_clause($controls);
+  $result = mysql_query($query);
+  $total = mysql_result(mysql_query("SELECT FOUND_ROWS()"), 0);
+  if (!$result || !mysql_num_rows($result)) {
+    $db_errno = mysql_errno();
+    if ($db_errno) {
+      error(__FILE__, __FUNCTION__, __LINE__, ERR_DB_READ, db_errno, mysql_error(), $query);
+      $ret = fail_return(ERR_DB_READ, $echo, $json);
+    } else {
+      warn(__FILE__, __FUNCTION__, __LINE__, OK_DATA_EMPTY_SET, $query);
+      $ret = succ_return(array(), $echo, $json, $total);
+    }
+  } else {
+    $data = array();
+    while ($row = mysql_fetch_array($result, MYSQL_ASSOC)) {
+      if($tbl == TBL_APPOINTMENT) {
+	    	if (!isset($row['refund'])) {$row['refund'] = 0;};
+	    	if (!isset($row['inst_refund'])) {$row['inst_refund'] = 0;};
+		    if (!isset($row['vat_refund'])) {$row['vat_refund'] = 0;};
+		    if (!isset($row['round_refund'])) {$row['round_refund'] = 0;};
+        $row['total_refund'] = $row['refund'] + $row['inst_refund'] + $row['vat_refund'] + $row['round_refund'];
+      } else if ($tbl == TBL_USER) {
+        $row = populate_user_para($row);
+      }
+      // Remove passwords from return results
+      unset($row[FIELD_PASS]);
+      foreach ($row as $key => $val) {
+        $row[$key] = utf8_encode($val);
+      }
+      array_push($data, $row);
+    }
+    mysql_free_result($result);
+    $ret = succ_return($data, $echo, $json, $total);
+  }
+  return $ret;
+}
+
+function db_update($tbl, $field_list, $val_list, $echo = true, $json = true, $old_list=array()) {
+  foreach ($val_list as $key => $val) {
+    $val_list[$key] = addslashes($val);
+  }
+  foreach ($old_list as $key => $val) {
+    $old_list[$key] = addslashes($val);
+  }
+  if (!$old_list) $old_list = $val_list;
+  if (isset($old_list[FIELD_ID])) $old_list = array(FIELD_ID => $old_list[FIELD_ID], FIELD_ARCHIVE => "true");
+  $where_clause = gen_where_clause($tbl, $field_list, $old_list);
+  $set_clause = gen_set_clause($tbl, get_field_list($tbl), $val_list);
+  if(!$set_clause) {
+    return fail_return(ERR_DB_UPDATE_NO_DATA, $echo, $json);
+  }
+  $query = "update `$tbl` $set_clause $where_clause";
+  $result = mysql_query($query);
+  if (!$result) {
+    $db_errno = mysql_errno();
+    warn(__FILE__, __FUNCTION__, __LINE__, ERR_DB_UPDATE, $tbl, $db_errno, mysql_error(), $query);
+    return fail_return(ERR_DB_UPDATE, $echo, $json);
+  }
+  info($_SESSION[FIELD_USER], $_SESSION[FIELD_TYPE], __FILE__, __FUNCTION__, __LINE__, OK_DATA_UPDATE, $tbl, $field_list, $val_list, mysql_affected_rows(), $query);
+  return succ_return(OK_DATA_UPDATE, $echo, $json);
+}
+
+function gen_update_list($tbl, $field_list, $val_list) {
+  $tbl_desc = get_tbl_desc($tbl);
+  $update_list = array();
+  foreach ($field_list as $field) {
+    if (isset($val_list[$field])) {
+      if ($tbl_desc[$field] == FIELD_TYPE_STR) {
+        array_push($update_list, "`$field` = '".$val_list[$field]."'");
+      } elseif ($tbl_desc[$field] == FIELD_TYPE_INT) {
+        array_push($update_list, "`$field` = ".$val_list[$field]."");
+      } elseif ($tbl_desc[$field] == FIELD_TYPE_OTHER) {
+        array_push($update_list, "`$field` = '".$val_list[$field]."'");
+      } else {
+        array_push($update_list, "`$field` = '".$val_list[$field]."'");
+      }
+    }
+  }
+  return $update_list;
+}
+
+function gen_limit_clause($controls) {
+  $start = (isset($controls['start']) && $controls['start']) ? $controls['start'] : 0;
+  $limit = (isset($controls['limit']) && $controls['limit']) ? $controls['limit'] : MAX_SCHEDULE_COUNT;
+  return " limit $start, $limit";
+}
+
+function gen_where_clause($tbl, $field_list, $val_list) {
+  $ret = "";
+  $tbl_desc = get_tbl_desc($tbl);
+  $condition_list = array();
+  $extra_tbl_list = array();
+  foreach ($val_list as $field => $val) {
+    $tok = explode(".", $field);
+    if (count($tok) == 2 && !(isset($val_list[FIELD_ID]) && $val_list[FIELD_ID])) {
+      $other_desc = get_tbl_desc($tok[0]);
+      $tbl_desc[$field] = $other_desc[$tok[1]];
+      if (!in_array($tok[0], $extra_tbl_list)) array_push($extra_tbl_list, $tok[0]);
+    }
+  }
+  $exact_match_field = array(FIELD_SPECIALITY => true, FIELD_PARA => true);
+  foreach ($field_list as $field) {
+    $tok = explode(".", $field);
+    $full_field = (count($tok) == 2) ? "`".$tok[0]."`.`".$tok[1]."`" : "`$tbl`.`$field`";
+	if (isset($val_list[$field]) && $val_list[$field] != "" && isset($tbl_desc[$field]) && $tbl_desc[$field]) {
+      if (isset($tbl_desc[$field]) && $tbl_desc[$field] == FIELD_TYPE_STR && !(isset($exact_match_field[$field]) && $exact_match_field[$field])) {
+        array_push($condition_list, "$full_field like '%".$val_list[$field]."%'");
+      } elseif ($tbl_desc[$field] == FIELD_TYPE_INT) {
+        array_push($condition_list, "$full_field = ".$val_list[$field]);
+      } elseif ($tbl_desc[$field] == FIELD_TYPE_OTHER) {
+        array_push($condition_list, "$full_field = '".$val_list[$field]."'");
+      } else {
+        array_push($condition_list, "$full_field = '".$val_list[$field]."'");
+      }
+    }
+    if($field == FIELD_TIMESTAMP) {
+      if (isset($val_list[FIELD_TIMESTAMP_MIN]) && $val_list[FIELD_TIMESTAMP_MIN]) {
+        array_push($condition_list, "`$tbl`.`$field`>='".$val_list[FIELD_TIMESTAMP_MIN]."'");
+      }
+      if (isset($val_list[FIELD_TIMESTAMP_MAX]) && $val_list[FIELD_TIMESTAMP_MAX]) {
+        array_push($condition_list, "`$tbl`.`$field`<='".$val_list[FIELD_TIMESTAMP_MAX]."'");
+      }
+    }
+  }
+  if($tbl == TBL_SCHEDULE_INSTANCE) {
+    if(!(isset($val_list[FIELD_DATE]) && $val_list[FIELD_DATE])) {
+      array_push($condition_list, "`$tbl`.`".FIELD_DATE."`>='".date('Y-m-d')."'");
+    }
+  }
+  //if(1 && !(1 && 1 && 1)) -> if (1 && 0) -> if (0)
+  if($tbl == TBL_APPOINTMENT && !(isset($val_list[FIELD_ARCHIVE]) && $val_list[FIELD_ARCHIVE] && $val_list[FIELD_ARCHIVE] != "false")) {
+    array_push($condition_list, "`$tbl`.`".FIELD_DATE."`>='".date('Y-m-d')."'");
+  }
+  if($condition_list) {
+    $ret = "where ".implode(" and ", $condition_list);
+    $tbl_join_map[TBL_DOCTOR][TBL_SCHEDULE_INSTANCE] = "`".TBL_DOCTOR."`.`".FIELD_ID."`=`".TBL_SCHEDULE_INSTANCE."`.`".FIELD_DOCTOR."`";
+    $tbl_join_map[TBL_SCHEDULE_INSTANCE][TBL_DOCTOR] = $tbl_join_map[TBL_DOCTOR][TBL_SCHEDULE_INSTANCE];
+    $tbl_join_map[TBL_DOCTOR][TBL_APPOINTMENT] = "`".TBL_DOCTOR."`.`".FIELD_ID."`=`".TBL_APPOINTMENT."`.`".FIELD_DOCTOR."`";
+    $tbl_join_map[TBL_APPOINTMENT][TBL_DOCTOR] = $tbl_join_map[TBL_DOCTOR][TBL_APPOINTMENT];
+    foreach ($extra_tbl_list as $extra_tbl) {
+      $ret = ", $extra_tbl ".$ret." and ".$tbl_join_map[$tbl][$extra_tbl];
+    }
+  }
+  return $ret;
+}
+
+function gen_order_by($tbl, $controls) {
+  if(isset($controls[FIELD_ORDER_BY]) && $controls[FIELD_ORDER_BY]) {
+    return "ORDER BY ".$controls[FIELD_ORDER_BY];
+  } else {
+    return "";
+  }
+}
+
+function gen_set_clause($tbl, $field_list, $val_list) {
+  $ret = "";
+  $update_list = gen_update_list($tbl, $field_list, $val_list);
+  if($update_list) {
+    $ret = "set ".implode(", ", $update_list);
+  }
+  return $ret;
+}
+
+function get_tbl_desc($tbl) {
+  $ret = array();
+  if(isset($_SESSION['tbl_desc'][$tbl])) {
+    $ret = $_SESSION['tbl_desc'][$tbl];
+  } else {
+    $query = "desc $tbl";
+    $result = mysql_query($query);
+    if (!$result || !mysql_num_rows($result)) {
+      $db_errno = mysql_errno();
+      if ($db_errno) {
+        error(__FILE__, __FUNCTION__, __LINE__, ERR_DB_READ, $db_errno, mysql_error(), $query);
+      } else {
+        warn(__FILE__, __FUNCTION__, __LINE__, OK_DATA_EMPTY_SET, $query);
+      }
+    } else {
+      while ($row = mysql_fetch_array($result, MYSQL_ASSOC)) {
+        $type = FIELD_TYPE_OTHER;
+        if (substr($row['Type'], 0, 3) == 'int') {
+          $type = FIELD_TYPE_INT;
+        } elseif (substr($row['Type'], 0, 4) == 'char') {
+          $type = FIELD_TYPE_STR;
+        } elseif (substr($row['Type'], 0, 7) == 'tinyint') {
+          $type = FIELD_TYPE_INT;
+        } elseif (substr($row['Type'], 0, 7) == 'varchar') {
+          $type = FIELD_TYPE_STR;
+        }
+        $ret[$row['Field']] = $type;
+      }
+      mysql_free_result($result);
+      $_SESSION['tbl_desc'][$tbl] = $ret;
+      info(__FILE__, __FUNCTION__, __LINE__, OK_DATA_READ, $tbl);
+    }
+  }
+  return $ret;
+}
+
+function get_row_count($tbl) {
+  $ret = 0;
+  $query = "select count(*) from $tbl";
+  $result = mysql_query($query);
+  if (!$result || mysql_num_rows($result) != 1) {
+    $db_errno = mysql_errno();
+    if ($db_errno) {
+      error(__FILE__, __FUNCTION__, __LINE__, ERR_DB_READ, db_errno, mysql_error(), $query);
+    } else {
+      warn(__FILE__, __FUNCTION__, __LINE__, ERR_DB_INCORRECT_ROW_COUNT, $query);
+    }
+  } else {
+    $row = mysql_fetch_array($result, MYSQL_NUM);
+    mysql_free_result($result);
+    $ret = $row[0];
+    info(__FILE__, __FUNCTION__, __LINE__, OK_DATA_READ, $tbl, $ret);
+  }
+  return $ret;
+}
+
+function db_restore($file) {
+  $templine = '';
+  $count = 0;
+  $err_list = array();
+  $lines = file($file);
+  foreach ($lines as $line) {
+    $count++;
+    if (substr($line, 0, 2) == '--' || $line == '') continue;
+    
+    $templine .= $line;
+    if (substr(trim($line), -1, 1) == ';') {
+      if (!mysql_query($templine)) {
+        $err_list[$count] = mysql_errno().":".mysql_error();
+      }
+      $templine = '';
+    }
+  }
+  if ($err_list) {
+    info(__FILE__, __FUNCTION__, __LINE__, $file, $err_list);
+    return fail_return(ERR_DB_RESTORE);
+  } else {
+    return succ_return(OK_DB_RESTORE);
+  }
+}
+
+function db_daily_report($tbl, $controls, $echo = true, $json = true) {
+  $ret = fail_return(ERR_UNKNOWN, false);
+  $where_clause = gen_where_clause($tbl, array_keys($controls), $controls);
+  $query = "SELECT SQL_CALC_FOUND_ROWS tbl_appointment.doctor as doctor, tbl_appointment.`date` as date, ".
+  					"sum(tbl_appointment.charge-tbl_appointment.refund) AS doc_fee, ".
+  					"sum(tbl_appointment.vat-tbl_appointment.vat_refund) as vat, ".
+					"sum(tbl_appointment.round_off-tbl_appointment.round_refund) as round_off, ".
+  					"sum(tbl_appointment.inst_charge-tbl_appointment.inst_refund) AS inst_fee FROM tbl_appointment ".
+            "$where_clause AND status<>1 GROUP BY tbl_appointment.doctor, tbl_appointment.`date` ".
+            "ORDER BY tbl_appointment.doctor, tbl_appointment.`date` desc";
+  $result = mysql_query($query);
+  $total = mysql_result(mysql_query("SELECT FOUND_ROWS()"), 0);
+  if (!$result || !mysql_num_rows($result)) {
+    $db_errno = mysql_errno();
+    if ($db_errno) {
+      error(__FILE__, __FUNCTION__, __LINE__, ERR_DB_READ, db_errno, mysql_error(), $query);
+      $ret = fail_return(ERR_DB_READ, $echo, $json);
+    } else {
+      warn(__FILE__, __FUNCTION__, __LINE__, OK_DATA_EMPTY_SET, $query);
+      $ret = succ_return(array(), $echo, $json, $total);
+    }
+  } else {
+    $data = array();
+    while ($row = mysql_fetch_array($result, MYSQL_ASSOC)) {
+      array_push($data, $row);
+    }
+    mysql_free_result($result);
+    $ret = succ_return($data, $echo, $json, $total);
+    info(__FILE__, __FUNCTION__, __LINE__, OK_DATA_READ, $ret, $query);
+  }
+  return $ret;
+}
+
+function db_monthly_report($tbl, $controls, $echo = true, $json = true) {
+  $ret = fail_return(ERR_UNKNOWN, false);
+  $where_clause = "WHERE 1=1 ";
+  if ($controls[FIELD_MONTH]) $where_clause .= " AND monthname(`date`)='".$controls[FIELD_MONTH]."'";
+  if ($controls[FIELD_YEAR]) $where_clause .= " AND year(`date`)=".$controls[FIELD_YEAR];
+  if ($controls[FIELD_DOCTOR]) {
+    if (is_numeric($controls[FIELD_DOCTOR])) {
+      $where_clause .= " AND doctor=".$controls[FIELD_DOCTOR];
+    } else {
+      $where_clause = ", tbl_doctor $where_clause AND tbl_doctor.name like '%".$controls[FIELD_DOCTOR]."%' AND tbl_doctor.id=tbl_appointment.doctor";
+    }
+  }
+  $query = "SELECT tbl_appointment.doctor as doctor, year(tbl_appointment.`date`) as year , monthname(tbl_appointment.`date`) as month, ".
+  					"sum(tbl_appointment.charge-tbl_appointment.refund) as doc_fee, ".
+					"sum(tbl_appointment.inst_charge-tbl_appointment.inst_refund) as inst_fee, ".
+  					"sum(tbl_appointment.vat-tbl_appointment.vat_refund) as vat, ".
+					"sum(tbl_appointment.round_off-tbl_appointment.round_refund) as round_off ".
+  					"FROM tbl_appointment $where_clause AND status<>1 ".
+            "GROUP BY doctor, year, month ORDER BY tbl_appointment.`date` desc";
+  $result = mysql_query($query);
+  $total = mysql_result(mysql_query("SELECT FOUND_ROWS()"), 0);
+  if (!$result || !mysql_num_rows($result)) {
+    $db_errno = mysql_errno();
+    if ($db_errno) {
+      error(__FILE__, __FUNCTION__, __LINE__, ERR_DB_READ, db_errno, mysql_error(), $query);
+      $ret = fail_return(ERR_DB_READ, $echo, $json);
+    } else {
+      warn(__FILE__, __FUNCTION__, __LINE__, OK_DATA_EMPTY_SET, $query);
+      $ret = succ_return(array(), $echo, $json, $total);
+    }
+  } else {
+    $data = array();
+    while ($row = mysql_fetch_array($result, MYSQL_ASSOC)) {
+      array_push($data, $row);
+    }
+    mysql_free_result($result);
+    $ret = succ_return($data, $echo, $json, $total);
+    info(__FILE__, __FUNCTION__, __LINE__, OK_DATA_READ, $ret, $query);
+  }
+  return $ret;
+}
+
+function update_schedule_instance_patient_count($schedule_id) {
+  $query = "UPDATE tbl_schedule_instance ".
+  					"SET patient = ( ".
+  						"SELECT count( * ) AS patient	".
+  						"FROM `tbl_appointment` ".
+  						"WHERE schedule = $schedule_id ".
+  					") ".
+  					"WHERE id = $schedule_id";
+  mysql_query($query);
+}
+
+function get_appointment_ref($status, $id = 0) {
+  $ret = 1;
+  $query = "SELECT SQL_CALC_FOUND_ROWS MAX(ref) AS max_ref FROM tbl_appointment WHERE status<>'1'";
+  if ($status == 1) {
+    $query = "SELECT SQL_CALC_FOUND_ROWS MAX(ref) AS max_ref FROM tbl_appointment WHERE status='1'";
+  }
+  $result = mysql_query($query);
+  $total = mysql_result(mysql_query("SELECT FOUND_ROWS()"), 0);
+  if ($total != 1) {
+    $db_errno = mysql_errno();
+    if ($db_errno) {
+      error(__FILE__, __FUNCTION__, __LINE__, ERR_DB_READ, db_errno, mysql_error(), $query);
+    } 
+  } else {
+    $row = mysql_fetch_array($result, MYSQL_ASSOC);
+    mysql_free_result($result);
+    $ret = $row['max_ref']+1;
+  
+    if ($id) {
+      $query2 = "SELECT status, ref FROM tbl_appointment WHERE id=$id";
+      $result2 = mysql_query($query2);
+      if($result2) {
+        $row2 = mysql_fetch_array($result2, MYSQL_ASSOC);
+        if ($row2['status'] == $status || $row2['status'] <> 1) {
+          $ret = $row2['ref'];
+        }
+      }
+    }
+  }
+  return $ret;
+}
+
+function db_clean($date) {
+  $tbl = TBL_APPOINTMENT;
+  $query = "DELETE FROM $tbl WHERE `date` < '$date'";
+  $result = mysql_query($query);
+  if (!$result) {
+    $db_errno = mysql_errno();
+    warn(__FILE__, __FUNCTION__, __LINE__, ERR_DB_DELETE, $db_errno, mysql_error(), $query);
+    return fail_return(ERR_DB_UPDATE);
+  }
+  info(__FILE__, __FUNCTION__, __LINE__, OK_DATA_DELETE, $query);
+  return succ_return(OK_DATA_UPDATE);
+}
+
+function db_collection_report($tbl, $controls, $echo = true, $json = true) {
+  $from = $controls['from_date'];
+  $to = $controls['to_date'];
+  $query = "
+SELECT 
+	a.ref AS ref , a.patient AS patient, `a`.`date` AS appointment_date, 
+	d.name AS doctor_id, a.charge AS doc_fee, a.inst_charge AS inst_fee,
+	a.vat AS vat, a.round_off AS round_off
+FROM `tbl_appointment` as a, `tbl_doctor` as d
+WHERE a.paytime >= '$from' AND a.paytime < ('$to' + INTERVAL 1 DAY) AND a.doctor=d.id
+ORDER BY ref";
+  $result = mysql_query($query);
+  $data = array();
+  while ($result && $row = mysql_fetch_array($result, MYSQL_ASSOC)) {
+    array_push($data, $row);
+  }
+  return $data;
+}
+
+function db_refund_report($tbl, $controls, $echo = true, $json = true) {
+  $from = $controls['from_date'];
+  $to = $controls['to_date'];
+  $query = "
+SELECT 
+	a.ref AS ref , a.patient AS patient, `a`.`date` AS appointment_date, 
+	d.name AS doctor_id, a.refund AS doc_fee, a.inst_refund AS inst_fee,
+	a.vat_refund AS vat, a.round_refund AS round_off
+FROM `tbl_appointment` as a, `tbl_doctor` as d
+WHERE (a.refund > 0 OR a.inst_refund > 0) AND a.refundtime >= '$from' AND a.refundtime < ('$to' + INTERVAL 1 DAY) AND a.doctor=d.id
+ORDER BY ref";
+  $result = mysql_query($query);
+  $data = array();
+  while ($result && $row = mysql_fetch_array($result, MYSQL_ASSOC)) {
+    array_push($data, $row);
+  }
+  return $data;
+}
+
+function db_closeby($tbl, $controls, $echo = true, $json = true) {
+  $lat = $controls['lat'];
+  $lon = $controls['lon'];
+  $start = isset($controls['start']) ? $controls['start'] : 0;
+  $limit = isset($controls['limit']) ? $controls['limit'] : 10;
+  $min_limit = isset($controls['min_limit']) ? $controls['min_limit'] : 3;
+  $max_limit = isset($controls['max_limit']) ? $controls['max_limit'] : $limit;
+  $max_distance = isset($controls['max_distance']) ? $controls['max_distance'] : 20;
+  $min_delta = 10; // KM
+  $max_delta = 100; // KM
+  $result = array();
+  $total = 0;
+  $delta = $min_delta;
+  do {
+    $order_by_clause = gen_order_by($tbl, $controls);
+
+    $query = "
+    SELECT SQL_CALC_FOUND_ROWS * FROM (
+      SELECT *, sqrt(($lat - lat)*($lat - lat) + ($lon - lon)*($lon - lon))*111 as distance FROM $tbl
+    ) as q WHERE q.distance < $delta $order_by_clause".gen_limit_clause($controls);
+    $result = mysql_query($query);
+    $total = mysql_result(mysql_query("SELECT FOUND_ROWS()"), 0);
+    $delta = ($max_delta < $delta and $delta < 2 * $max_delta) ? $max_delta : 2 * $delta;
+  } while ($limit > $total and $delta <= $max_delta);
+  $data = array();
+  $row_count = 0;
+  while ($result && $row = mysql_fetch_array($result, MYSQL_ASSOC)) {
+    if ($row_count++ < $min_limit) {
+      array_push($data, $row);
+    } elseif ($row['distance'] <= $max_distance) {
+      array_push($data, $row);
+    } else {
+      break;
+    }
+  }
+  $total = sizeof($data);
+  $ret = succ_return($data, $echo, $json, $total);
+  return $ret;
+}
+
+function update_user_session_id($db_id, $session_id) {
+  $query = "update tbl_user set session_id='$session_id' where id=$db_id";
+  $result = mysql_query($query);
+  if (!$result) {
+    $db_errno = mysql_errno();
+    warn(__FILE__, __FUNCTION__, __LINE__, ERR_DB_UPDATE, $db_errno, mysql_error(), $query);
+  }
+  info(__FILE__, __FUNCTION__, __LINE__, OK_DATA_UPDATE, mysql_affected_rows(), $query);
+}
+
+function check_session($session_id) {
+  $query = "select ".FIELD_USER.", ".FIELD_ID.", ".FIELD_TYPE." from ".TBL_USER." where ".FIELD_SESSION_ID."='$session_id'";
+  $result = mysql_query($query);
+  
+  $db_errno = mysql_errno();
+  if (!$result && $db_errno) {
+    exit(db_error(__FILE__, __FUNCTION__, __LINE__, ERR_DB_READ, $db_errno, mysql_error(), false));
+  }
+  if (!$result || mysql_num_rows($result) != 1) {
+    info(__FILE__, __FUNCTION__, __LINE__, ERR_AUTHENTICATION, $result);
+    return ERR_AUTHENTICATION;
+  }
+  $raw = mysql_fetch_array($result, MYSQL_ASSOC);
+  $db_id = $raw[FIELD_ID];
+  $db_user = $raw[FIELD_USER];
+  $db_type = $raw[FIELD_TYPE];
+  
+  if(!isset($_SESSION[FIELD_USER])) {
+    $_SESSION[FIELD_ID] = $db_id;
+    $_SESSION[FIELD_USER] = $db_user;
+    $_SESSION[FIELD_TYPE] = $db_type;
+
+    update_extra_user_info($db_id);
+  }
+
+  $user = $_SESSION[FIELD_USER];
+  if ($db_user != $user) {
+    info(__FILE__, __FUNCTION__, __LINE__, ERR_AUTHENTICATION, $user, $db_user);
+    return ERR_AUTHENTICATION;
+  }
+  return OK_USER; 
+}
+
+function db_get_last_insert_id() {
+  return mysql_insert_id();
+}
+
+function populate_user_para($in_row) {
+  $user_id = $in_row[FIELD_ID];
+  $query = "select * from ".TBL_USER_PARA." where ".FIELD_USER_ID."='$user_id'";
+  $result = mysql_query($query);
+  
+  $db_errno = mysql_errno();
+  if (!$result && $db_errno) {
+    return $row;
+  }
+  while ($row = mysql_fetch_array($result, MYSQL_ASSOC)) {
+    $in_row[$row[FIELD_PARA]] = $row[FIELD_VAL];   
+  }
+  mysql_free_result($result); 
+  return $in_row;
+}
+
+function update_extra_user_info($db_id) {
+  $query = "select * from ".TBL_USER_PARA." where ".FIELD_USER_ID."='$db_id'";
+  $result = mysql_query($query);
+  
+  $db_errno = mysql_errno();
+  if (!$result && $db_errno) {
+    exit(db_error(__FILE__, __FUNCTION__, __LINE__, ERR_DB_READ, $db_errno, mysql_error(), false));
+  }
+  
+  while ($row = mysql_fetch_array($result, MYSQL_ASSOC)) {
+    if ($row['para'] == 'first_name') {
+      if (isset($_SESSION[FIELD_NAME]) && $_SESSION[FIELD_NAME]) {
+        $_SESSION[FIELD_NAME] = $row['val'] . " " . $_SESSION[FIELD_NAME];
+      } else {
+        $_SESSION[FIELD_NAME] = $row['val'];
+      }
+    } else if ($row['para'] == 'last_name') {
+      if (isset($_SESSION[FIELD_NAME]) && $_SESSION[FIELD_NAME]) {
+        $_SESSION[FIELD_NAME] = $_SESSION[FIELD_NAME] . " " . $row['val'];
+      } else {
+        $_SESSION[FIELD_NAME] = $row['val'];
+      }
+    } else if ($row['para'] == 'mobile') {
+      $_SESSION[FIELD_TEL] = $row['val'];
+    }
+  } 
+  mysql_free_result($result);
+}
+?>

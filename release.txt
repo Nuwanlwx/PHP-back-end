@@ -1,0 +1,29 @@
+Release 1.3.3 - 2019/03/29
+- #565: Enabled Dialog Digital Reach SMS Gateway to receive SMSes
+
+Release 1.3.2 - 2019/03/25
+- #567: Quick fix to the sales not adding issue to the DB. 
+        TODO: Remove once the changes are done from Mobile App (Front end)
+
+Release 1.3.1 - 2019/03/25
+- #565: URL encoding applicable only to Textware SMS API
+
+Release 1.3.0 - 2019/03/24
+- #565: Implemented outbound SMSes via Dialog Digital Service API
+- #565: Implemented to switch Textware or Dialog DS APIs using settings in config.php
+- #565: TODO - Inbound API integration for Dialog DS API
+- #565: TODO - Merge forgot password fix/implementation in version 1.2.x
+
+Release 1.1.3 - 2019/03/06
+- #435: Fix the issue of not supporting array constant (on server)
+- #435: API call response
+- #435: Enabled SMS responses to agents
+- #435: Enabled Agent Name also in SMS instead of ID
+- #435: Added sales data included in response SMS for success case too
+
+Release 1.1.2 - 2019/03/06
+- #435: Handle incorrect SMS format
+
+Release 1.1.1 - 2019/03/05 
+- #460: CEAT Dealer/Fitter Window CR
+- #435: CEAT Sales Records via SMS
